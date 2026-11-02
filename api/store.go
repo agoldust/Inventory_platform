@@ -45,6 +45,9 @@ type Store interface {
 	// records the movement with reason, atomically. It returns ErrNotFound for
 	// an unknown id and ErrInsufficientStock if stock would go negative.
 	AdjustStock(ctx context.Context, id int64, change int, reason string) (Product, error)
+	// DeleteProduct removes a product and, by cascade, its stock movements.
+	// It returns ErrNotFound for an unknown id.
+	DeleteProduct(ctx context.Context, id int64) error
 }
 
 // PgStore is the PostgreSQL implementation of Store, backed by a pgx pool.
@@ -92,6 +95,18 @@ func (s *PgStore) GetProduct(ctx context.Context, id int64) (Product, error) {
 func (s *PgStore) CreateProduct(ctx context.Context, name string, price float64) (Product, error) {
 	return scan(s.db.QueryRow(ctx,
 		`INSERT INTO products (name, price) VALUES ($1, $2) RETURNING `+cols, name, price))
+}
+
+// DeleteProduct implements Store.
+func (s *PgStore) DeleteProduct(ctx context.Context, id int64) error {
+	tag, err := s.db.Exec(ctx, `DELETE FROM products WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // AdjustStock implements Store. It updates stock and records the movement in
