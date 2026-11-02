@@ -7,13 +7,16 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // API holds the HTTP handlers and the Store they read and write through.
 type API struct{ store Store }
 
-// routes registers every endpoint on a new mux and returns it as the
-// server's root handler. Method and path patterns use Go 1.22 routing.
+// routes registers every endpoint (including GET /metrics) on a new mux and
+// returns it, wrapped in the metrics middleware, as the server's root handler.
+// Method and path patterns use Go 1.22 routing.
 func (a *API) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -23,7 +26,10 @@ func (a *API) routes() http.Handler {
 	mux.HandleFunc("GET /products/{id}", a.get)
 	mux.HandleFunc("POST /products", a.create)
 	mux.HandleFunc("PATCH /products/{id}/stock", a.adjustStock)
-	return mux
+	mux.HandleFunc("DELETE /products/{id}", a.remove)
+	mux.HandleFunc("GET /variant", a.variant)
+	mux.Handle("GET /metrics", promhttp.Handler())
+	return instrument(mux)
 }
 
 // list handles GET /products: 200 with a JSON array of all products.
@@ -65,7 +71,8 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 // adjustStock handles PATCH /products/{id}/stock with {"change","reason"}.
 // A positive change adds stock, a negative one removes it. It returns 200 with
 // the updated product, 400 for a bad id, a zero change or a blank reason,
-// 404 for an unknown product, and 409 if stock would go negative.
+// 404 for an unknown product, and 409 if stock would go negative. Each
+// successful change increments stock_changes_total.
 func (a *API) adjustStock(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
@@ -83,7 +90,29 @@ func (a *API) adjustStock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p, err := a.store.AdjustStock(r.Context(), id, in.Change, in.Reason)
+	if err == nil {
+		direction := "increase"
+		if in.Change < 0 {
+			direction = "decrease"
+		}
+		stockChanges.WithLabelValues(direction).Inc()
+	}
 	respond(w, p, http.StatusOK, err)
+}
+
+// remove handles DELETE /products/{id}: 204 with no body on success, 400 for
+// a bad id, 404 if it does not exist. The product's stock movements are
+// deleted with it.
+func (a *API) remove(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if err := a.store.DeleteProduct(r.Context(), id); err != nil {
+		respond(w, nil, 0, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // pathID parses the {id} path value as a positive integer. On failure it
